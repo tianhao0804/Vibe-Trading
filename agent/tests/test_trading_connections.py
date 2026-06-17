@@ -207,7 +207,9 @@ def test_robinhood_remote_place_order_uses_guarded_current_write_tool(
         notional=25.0,
         order_type="market",
         time_in_force="day",
+        market_hours="all_day_hours",
         session_id="sess-1",
+        account=account_ref,
     )
 
     assert result["status"] == "ok"
@@ -221,11 +223,13 @@ def test_robinhood_remote_place_order_uses_guarded_current_write_tool(
         (
             "place_equity_order",
             {
+                "account_number": account_ref,
                 "symbol": "AAPL",
                 "side": "buy",
                 "type": "market",
-                "time_in_force": "day",
-                "dollar_amount": 25.0,
+                "time_in_force": "gfd",
+                "market_hours": "all_day_hours",
+                "dollar_amount": "25",
             },
         ),
     ]
@@ -254,6 +258,32 @@ def test_robinhood_remote_place_order_requires_write_allowlist(
     assert result["status"] == "error"
     assert "place_equity_order" in result["error"]
     assert "not enabled" in result["error"]
+
+
+def test_robinhood_remote_place_order_requires_explicit_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Write-enabled Robinhood live orders must still name the account."""
+    server = SimpleNamespace(
+        url="https://agent.robinhood.com/mcp/trading",
+        enabled_tools=["get_portfolio", "get_equity_positions", "place_equity_order"],
+        auth=SimpleNamespace(cache_dir="/tmp/vibe-token"),
+    )
+    monkeypatch.setattr("src.config.loader.load_agent_config", lambda: _agent_config(server))
+    monkeypatch.setattr("src.live.registry.has_cached_oauth_token", lambda *_: True)
+
+    result = service.place_order(
+        "AAPL",
+        "robinhood-live-mcp",
+        side="buy",
+        quantity=1,
+        order_type="limit",
+        limit_price=1.0,
+        session_id="sess-1",
+    )
+
+    assert result["status"] == "error"
+    assert "account" in result["error"].lower()
 
 
 def test_robinhood_remote_cancel_order_uses_current_tool_and_audits(
@@ -290,12 +320,22 @@ def test_robinhood_remote_cancel_order_uses_current_tool_and_audits(
         "robinhood-live-mcp",
         symbol="AAPL",
         session_id="sess-1",
+        account="RH_AGENTIC_TEST_ACCOUNT",
     )
 
     assert result["status"] == "ok"
     assert result["state"] == "cancelled"
     assert result["profile_id"] == "robinhood-live-mcp"
-    assert calls == [("cancel_equity_order", {"order_id": "ord_123", "symbol": "AAPL"})]
+    assert calls == [
+        (
+            "cancel_equity_order",
+            {
+                "account_number": "RH_AGENTIC_TEST_ACCOUNT",
+                "order_id": "ord_123",
+                "symbol": "AAPL",
+            },
+        )
+    ]
     assert audits[0]["kind"] == "order_cancelled"
     assert audits[0]["remote_tool"] == "cancel_equity_order"
 

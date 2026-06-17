@@ -246,6 +246,7 @@ def place_order(
     order_type: str = "market",
     limit_price: float | None = None,
     time_in_force: str = "day",
+    market_hours: str = "regular_hours",
     session_id: str = "",
     **overrides: Any,
 ) -> dict[str, Any]:
@@ -268,7 +269,9 @@ def place_order(
             order_type=order_type,
             limit_price=limit_price,
             time_in_force=time_in_force,
+            market_hours=market_hours,
             session_id=session_id,
+            account=_clean(overrides.get("account")),
         )
     if profile.transport != "broker_sdk":
         return _unsupported(profile, "orders.place")
@@ -334,6 +337,7 @@ def cancel_order(
             order_id=order_id,
             symbol=symbol,
             session_id=session_id,
+            account=_clean(overrides.get("account")),
         )
     if profile.transport != "broker_sdk":
         return _unsupported(profile, "orders.cancel")
@@ -355,7 +359,9 @@ def _place_remote_live_order(
     order_type: str,
     limit_price: float | None,
     time_in_force: str,
+    market_hours: str,
     session_id: str,
+    account: str | None,
 ) -> dict[str, Any]:
     """Place a live remote-MCP order through the mandate guard."""
     from src.live.order_guard import LiveOrderGuardTool
@@ -369,15 +375,20 @@ def _place_remote_live_order(
     if "error" in context:
         return context["error"]
 
-    broker_request = _remote_order_arguments(
-        symbol=symbol,
-        side=side,
-        quantity=quantity,
-        notional=notional,
-        order_type=order_type,
-        limit_price=limit_price,
-        time_in_force=time_in_force,
-    )
+    try:
+        broker_request = _remote_order_arguments(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            order_type=order_type,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+            market_hours=market_hours,
+            account=account,
+        )
+    except ValueError as exc:
+        return _with_profile(profile, {"status": "error", "error": str(exc)})
     adapter = MCPServerAdapter(context["server_name"], context["server"])
     spec = MCPRemoteToolSpec(
         server_name=context["server_name"],
@@ -401,6 +412,7 @@ def _cancel_remote_live_order(
     order_id: str,
     symbol: str | None,
     session_id: str,
+    account: str | None,
 ) -> dict[str, Any]:
     """Cancel a live remote-MCP order and audit the risk-reducing write."""
     from src.tools.mcp import MCPServerAdapter
@@ -413,7 +425,20 @@ def _cancel_remote_live_order(
     if "error" in context:
         return context["error"]
 
-    broker_request: dict[str, Any] = {"order_id": order_id}
+    account_number = str(account or "").strip()
+    if not account_number:
+        return _with_profile(
+            profile,
+            {
+                "status": "error",
+                "error": (
+                    "Robinhood live order cancellation requires an explicit account number. "
+                    "Pass account=<account_number>."
+                ),
+            },
+        )
+
+    broker_request: dict[str, Any] = {"account_number": account_number, "order_id": order_id}
     if symbol:
         broker_request["symbol"] = symbol
 
@@ -443,21 +468,60 @@ def _remote_order_arguments(
     order_type: str,
     limit_price: float | None,
     time_in_force: str,
+    market_hours: str,
+    account: str | None,
 ) -> dict[str, Any]:
     """Map generic trading tool order fields to Robinhood's current MCP schema."""
+    account_number = str(account or "").strip()
+    if not account_number:
+        raise ValueError(
+            "Robinhood live orders require an explicit account number. "
+            "Pass account=<account_number>."
+        )
+
     args: dict[str, Any] = {
+        "account_number": account_number,
         "symbol": str(symbol or "").strip().upper(),
         "side": str(side or "").strip().lower(),
         "type": str(order_type or "market").strip().lower(),
-        "time_in_force": str(time_in_force or "day").strip().lower(),
+        "time_in_force": _robinhood_time_in_force(time_in_force),
+        "market_hours": _robinhood_market_hours(market_hours),
     }
     if notional is not None:
-        args["dollar_amount"] = float(notional)
+        args["dollar_amount"] = _robinhood_decimal(notional)
     if quantity is not None:
-        args["quantity"] = float(quantity)
+        args["quantity"] = _robinhood_decimal(quantity)
     if limit_price is not None:
-        args["limit_price"] = float(limit_price)
+        args["limit_price"] = _robinhood_decimal(limit_price)
     return args
+
+
+def _robinhood_decimal(value: float) -> str:
+    """Format a numeric order field for Robinhood's string-based MCP schema."""
+    return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+
+def _robinhood_time_in_force(value: str) -> str:
+    """Map generic TIF values to Robinhood MCP values."""
+    normalized = str(value or "day").strip().lower()
+    aliases = {"day": "gfd", "gfd": "gfd", "gtc": "gtc"}
+    return aliases.get(normalized, normalized)
+
+
+def _robinhood_market_hours(value: str) -> str:
+    """Map generic market-hours values to Robinhood MCP values."""
+    normalized = str(value or "regular_hours").strip().lower()
+    aliases = {
+        "regular": "regular_hours",
+        "regular_hours": "regular_hours",
+        "extended": "extended_hours",
+        "extended_hours": "extended_hours",
+        "overnight": "all_day_hours",
+        "all_day": "all_day_hours",
+        "all_day_hours": "all_day_hours",
+        "24h": "all_day_hours",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _remote_write_context(profile: TradingProfile, remote_name: str) -> dict[str, Any]:

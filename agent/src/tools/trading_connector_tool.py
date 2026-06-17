@@ -334,6 +334,12 @@ class TradingPlaceOrderTool(BaseTool):
             "order_type": {"type": "string", "enum": ["market", "limit"], "default": "market"},
             "limit_price": {"type": "number", "description": "Required for limit orders."},
             "time_in_force": {"type": "string", "enum": ["day", "gtc"], "default": "day"},
+            "market_hours": {
+                "type": "string",
+                "enum": ["regular_hours", "extended_hours", "all_day_hours"],
+                "default": "regular_hours",
+                "description": "Robinhood live MCP market-hours session.",
+            },
         },
         "required": ["symbol", "side"],
     }
@@ -353,6 +359,7 @@ class TradingPlaceOrderTool(BaseTool):
                     order_type=str(kwargs.get("order_type") or "market"),
                     limit_price=_num_or_none(kwargs.get("limit_price")),
                     time_in_force=str(kwargs.get("time_in_force") or "day"),
+                    market_hours=str(kwargs.get("market_hours") or "regular_hours"),
                     **_overrides(kwargs),
                 )
             )
