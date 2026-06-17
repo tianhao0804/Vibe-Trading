@@ -569,7 +569,7 @@ class MCPRemoteTool(BaseTool):
             self._filter_arguments(kwargs),
             local_name=self.name,
         )
-        return json.dumps(payload, ensure_ascii=False, default=_json_default)
+        return json.dumps(_make_jsonable(payload), ensure_ascii=False, default=_json_default)
 
     def _filter_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Drop local-only arguments before forwarding to the remote tool.
@@ -980,7 +980,7 @@ def _format_exception_message(exc: Exception) -> str:
     return str(exc) or type(exc).__name__
 
 
-def _make_jsonable(value: Any) -> Any:
+def _make_jsonable(value: Any, _seen: set[int] | None = None) -> Any:
     """Convert FastMCP response payloads into JSON-serializable objects.
 
     Args:
@@ -989,12 +989,37 @@ def _make_jsonable(value: Any) -> Any:
     Returns:
         JSON-serializable equivalent.
     """
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if _seen is None:
+        _seen = set()
+    trackable = isinstance(value, (dict, list, tuple, set)) or hasattr(value, "model_dump")
+    if trackable:
+        oid = id(value)
+        if oid in _seen:
+            return "[circular]"
+        _seen.add(oid)
+    else:
+        oid = None
+    try:
+        return _make_jsonable_inner(value, _seen)
+    finally:
+        if oid is not None:
+            _seen.discard(oid)
+
+
+def _make_jsonable_inner(value: Any, _seen: set[int]) -> Any:
+    """Implementation for :func:`_make_jsonable` after cycle bookkeeping."""
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json", by_alias=True, exclude_none=True)
-    if isinstance(value, list):
-        return [_make_jsonable(item) for item in value]
+        try:
+            dumped = value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        except Exception:  # noqa: BLE001 - display fallback for unusual SDK objects
+            return str(value)
+        return _make_jsonable(dumped, _seen)
+    if isinstance(value, (list, tuple, set)):
+        return [_make_jsonable(item, _seen) for item in value]
     if isinstance(value, dict):
-        return {str(key): _make_jsonable(item) for key, item in value.items()}
+        return {str(key): _make_jsonable(item, _seen) for key, item in value.items()}
     return value
 
 

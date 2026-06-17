@@ -13,6 +13,8 @@ from mcp import types as mcp_types
 
 from src.config.schema import MCPServerConfig
 from src.tools.mcp import (
+    MCPRemoteTool,
+    MCPRemoteToolSpec,
     MCPServerAdapter,
     build_mcp_tool_wrappers,
     format_mcp_server_name_collision_warning,
@@ -275,6 +277,32 @@ def test_remote_tool_execute_forwards_arguments_for_composed_schema() -> None:
 
     assert payload["status"] == "ok"
     assert state["call_records"][0]["arguments"] == {"symbol": "AAPL"}
+
+
+def test_remote_tool_execute_serializes_circular_payload() -> None:
+    class CircularAdapter:
+        server_name = "demo"
+
+        def call_tool(self, name, arguments, *, local_name=None):
+            payload = {"status": "ok", "name": name, "arguments": arguments}
+            payload["self"] = payload
+            return payload
+
+    tool = MCPRemoteTool(
+        CircularAdapter(),
+        MCPRemoteToolSpec(
+            server_name="demo",
+            remote_name="place_order",
+            local_name="mcp_demo_place_order",
+            description="Place order",
+            parameters={"type": "object", "additionalProperties": True},
+        ),
+    )
+
+    payload = json.loads(tool.execute(symbol="SPCX"))
+
+    assert payload["status"] == "ok"
+    assert payload["self"] == "[circular]"
 
 
 def test_build_mcp_tool_wrappers_disambiguates_colliding_local_names() -> None:

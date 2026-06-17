@@ -335,8 +335,10 @@ def _position_market_value(row: dict) -> float | None:
     """Extract one position's USD market value, fail-closed.
 
     Prefers an explicit ``market_value`` field; otherwise derives it from
-    ``quantity`` × (``price`` | ``last_price`` | ``mark_price``). Returns
-    ``None`` if neither is parseable.
+    ``quantity`` × (``price`` | ``last_price`` | ``mark_price``). Robinhood
+    Agentic positions omit market price, so ``average_buy_price`` is accepted as
+    a cost-basis fallback for exposure checks. Returns ``None`` if neither path
+    is parseable.
     """
     for key in ("market_value", "marketValue", "value_usd", "value"):
         if key in row:
@@ -348,7 +350,7 @@ def _position_market_value(row: dict) -> float | None:
             qty = _as_float(row[key])
             break
     price = None
-    for key in ("price", "last_price", "mark_price", "market_price"):
+    for key in ("price", "last_price", "mark_price", "market_price", "average_buy_price"):
         if key in row:
             price = _as_float(row[key])
             break
