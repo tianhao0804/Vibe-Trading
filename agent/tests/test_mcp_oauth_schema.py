@@ -15,6 +15,8 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from fastmcp.client.auth import OAuth
 from fastmcp.client.transports.http import StreamableHttpTransport
@@ -31,7 +33,7 @@ from src.config.schema import (
     MCPServerConfig,
     MCPServerConfigOverride,
 )
-from src.tools.mcp import MCPServerAdapter
+from src.tools.mcp import MCPServerAdapter, _build_token_store
 
 pytestmark = pytest.mark.unit
 
@@ -204,7 +206,7 @@ def _build_transport(server_config: MCPServerConfig):
     return MCPServerAdapter("robinhood", server_config)._build_client().transport
 
 
-def test_build_client_yields_oauth_streamable_transport() -> None:
+def test_build_client_yields_oauth_streamable_transport(tmp_path) -> None:
     cfg = MCPServerConfig.model_validate(
         {
             "type": "streamableHttp",
@@ -217,6 +219,7 @@ def test_build_client_yields_oauth_streamable_transport() -> None:
                 "client_id": "client-id",
                 "client_secret": "client-secret",
                 "client_metadata_url": "https://example.com/oauth/client.json",
+                "cache_dir": str(tmp_path / "oauth"),
             },
         }
     )
@@ -231,6 +234,31 @@ def test_build_client_yields_oauth_streamable_transport() -> None:
     assert transport.auth._client_id == "client-id"
     assert transport.auth._client_secret == "client-secret"
     assert transport.auth._client_metadata_url == "https://example.com/oauth/client.json"
+
+
+def test_oauth_token_store_accepts_url_keys(tmp_path) -> None:
+    """FastMCP stores OAuth client info under the MCP URL as a key."""
+    store = _build_token_store(str(tmp_path / "oauth"))
+
+    async def _write() -> None:
+        await store.put(
+            key="https://agent.robinhood.com/mcp/trading",
+            value={"client_id": "client-1"},
+            collection="mcp-oauth-client-info",
+        )
+
+    asyncio.run(_write())
+
+    assert (tmp_path / "oauth" / "mcp-oauth-client-info").exists()
+    assert (
+        asyncio.run(
+            store.get(
+                key="https://agent.robinhood.com/mcp/trading",
+                collection="mcp-oauth-client-info",
+            )
+        )
+        == {"client_id": "client-1"}
+    )
 
 
 def test_static_header_http_path_unchanged() -> None:

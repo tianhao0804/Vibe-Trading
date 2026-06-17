@@ -11,8 +11,10 @@ import re
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine, Iterable, Protocol, TypeVar
 
+from anyio import Path as AsyncPath
 from fastmcp.client import Client
 from fastmcp.client.auth import OAuth
 from fastmcp.client.client import CallToolResult
@@ -254,6 +256,21 @@ def normalize_mcp_tool_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
     return normalized
 
 
+class _OAuthFileTreeStore(FileTreeStore):
+    """FileTreeStore variant that supports OAuth provider URLs as keys."""
+
+    async def _put_managed_entry(self, *, key: str, collection: str, managed_entry: Any) -> None:
+        collection_info = self._collection_infos[collection]
+        sanitized_key = collection_info.key_sanitization_strategy.sanitize(value=key)
+        key_path = Path(collection_info.directory) / f"{sanitized_key}.json"
+
+        await collection_info._validate_path_security(path=AsyncPath(key_path))
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(key_path.parent, 0o700)
+
+        await collection_info.put_entry(key=key, data=managed_entry)
+
+
 def _build_token_store(cache_dir: str) -> FileTreeStore:
     """Build a persistent OAuth token store rooted at ``cache_dir``.
 
@@ -270,13 +287,11 @@ def _build_token_store(cache_dir: str) -> FileTreeStore:
     Returns:
         A ``FileTreeStore`` rooted at the resolved cache directory.
     """
-    from pathlib import Path
-
     path = Path(cache_dir).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     # 0700: owner-only. Tokens are secrets; no group/other access.
     os.chmod(path, 0o700)
-    return FileTreeStore(data_directory=path)
+    return _OAuthFileTreeStore(data_directory=path)
 
 
 class MCPServerAdapter:
