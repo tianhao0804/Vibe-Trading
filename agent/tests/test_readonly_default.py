@@ -324,3 +324,26 @@ def test_should_register_live_channel_headless_with_cached_token(live_runtime: P
     assert has_cached_oauth_token(url, cache) is True
     # With a cached token, even a non-interactive run registers the channel.
     assert should_register_live_channel(interactive=False, url=url, cache_dir=cache) is True
+
+
+def test_should_register_live_channel_with_url_keyed_cached_token(live_runtime: Path) -> None:
+    import asyncio
+
+    from src.live.registry import has_cached_oauth_token, should_register_live_channel
+    from src.tools.mcp import _build_token_store
+
+    cache = str(live_runtime / "live" / "robinhood" / "oauth")
+    url = "https://agent.robinhood.com/mcp/trading"
+
+    async def _seed_token() -> None:
+        store = _build_token_store(cache)
+        await store.put(
+            collection="mcp-oauth-token",
+            key=url,
+            value={"access_token": "cached"},
+        )
+
+    asyncio.run(_seed_token())
+
+    assert has_cached_oauth_token(url, cache) is True
+    assert should_register_live_channel(interactive=False, url=url, cache_dir=cache) is True

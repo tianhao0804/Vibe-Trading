@@ -130,9 +130,10 @@ def has_cached_oauth_token(url: str, cache_dir: str) -> bool:
         collection = Path(cache_dir).expanduser() / _OAUTH_TOKEN_COLLECTION
         if not collection.is_dir():
             return False
-        # Any persisted token entry (FileTreeStore writes one file per key, plus
-        # a sidecar ``*-info.json`` at the cache root — not inside the dir).
-        return any(p.is_file() for p in collection.iterdir())
+        # Any persisted token entry. URL-keyed OAuth caches may materialize as
+        # nested files under the collection directory, so scan recursively while
+        # never reading token contents.
+        return any(p.is_file() for p in collection.rglob("*.json"))
     except OSError as exc:
         logger.debug("OAuth token presence check failed for %s: %s", url, exc)
         return False
