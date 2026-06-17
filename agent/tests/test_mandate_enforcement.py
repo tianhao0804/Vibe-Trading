@@ -138,6 +138,7 @@ def _write_mandate(live_runtime: Path, mandate: Mandate) -> None:
             "min_market_cap_usd": mandate.universe.min_market_cap_usd,
             "min_avg_daily_volume_usd": mandate.universe.min_avg_daily_volume_usd,
             "exclude_symbols": list(mandate.universe.exclude_symbols),
+            "include_symbols": list(mandate.universe.include_symbols),
         },
         "consent": {
             "created_at": mandate.consent.created_at,
@@ -181,6 +182,46 @@ def _check(intent: OrderIntent, mandate: Mandate, *, positions=None, daily_count
 
 def test_in_mandate_order_passes() -> None:
     assert _check(_intent(notional_usd=100.0), _mandate()) is None
+
+
+def test_include_symbols_allowlist_denies_other_symbols() -> None:
+    mandate = _mandate()
+    mandate = Mandate(
+        schema_version=mandate.schema_version,
+        hard_caps=mandate.hard_caps,
+        universe=UniverseConstraint(
+            asset_classes=mandate.universe.asset_classes,
+            min_market_cap_usd=mandate.universe.min_market_cap_usd,
+            min_avg_daily_volume_usd=mandate.universe.min_avg_daily_volume_usd,
+            exclude_symbols=mandate.universe.exclude_symbols,
+            include_symbols=("SPCX",),
+        ),
+        consent=mandate.consent,
+    )
+
+    breach = _check(_intent(symbol="AAPL"), mandate)
+
+    assert breach is not None
+    assert breach.limit == "include_symbols"
+    assert breach.kind == BREACH_KIND_UNIVERSE
+
+
+def test_include_symbols_allowlist_allows_listed_symbol() -> None:
+    mandate = _mandate()
+    mandate = Mandate(
+        schema_version=mandate.schema_version,
+        hard_caps=mandate.hard_caps,
+        universe=UniverseConstraint(
+            asset_classes=mandate.universe.asset_classes,
+            min_market_cap_usd=mandate.universe.min_market_cap_usd,
+            min_avg_daily_volume_usd=mandate.universe.min_avg_daily_volume_usd,
+            exclude_symbols=mandate.universe.exclude_symbols,
+            include_symbols=("SPCX",),
+        ),
+        consent=mandate.consent,
+    )
+
+    assert _check(_intent(symbol="SPCX"), mandate) is None
 
 
 @pytest.mark.parametrize(

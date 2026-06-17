@@ -477,4 +477,5 @@ def _profile_to_universe(profile: Mapping[str, Any]) -> dict[str, Any]:
         "min_market_cap_usd": profile.get("min_market_cap_usd"),
         "min_avg_daily_volume_usd": profile.get("min_avg_daily_volume_usd"),
         "exclude_symbols": list(profile.get("exclude_symbols") or []),
+        "include_symbols": list(profile.get("include_symbols") or profile.get("universe") or []),
     }

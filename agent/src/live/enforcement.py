@@ -389,11 +389,11 @@ def check_mandate(
     """Evaluate one order intent against the mandate (fail-closed).
 
     Checks run in a fixed order and the first failure produces the verdict:
-    exclude-list, instrument allowance, asset-class allowance (universe market-
-    cap/liquidity), single-order notional, post-trade total exposure, post-trade
-    gross leverage, daily order count, and funding (defense-in-depth). Any
-    unparseable input (bad intent, unreadable positions, missing market data)
-    denies rather than allows.
+    exclude-list, optional include-list, instrument allowance, asset-class
+    allowance (universe market-cap/liquidity), single-order notional,
+    post-trade total exposure, post-trade gross leverage, daily order count,
+    and funding (defense-in-depth). Any unparseable input (bad intent,
+    unreadable positions, missing market data) denies rather than allows.
 
     Args:
         mandate: The active, schema-valid, unexpired mandate (validated by the
@@ -431,7 +431,17 @@ def check_mandate(
             detail=f"{symbol} is on the mandate exclude list",
         )
 
-    # 2. Instrument-type allowance (empty == deny all, fail-closed).
+    # 2. Optional include-list — empty means no symbol-level allowlist.
+    include_symbols = {s.strip().upper() for s in universe.include_symbols if str(s).strip()}
+    if include_symbols and symbol not in include_symbols:
+        return _breach(
+            broker=broker, remote_tool=remote_tool, intent=intent,
+            kind=BREACH_KIND_UNIVERSE, limit="include_symbols",
+            limit_value=0.0, attempted_value=0.0,
+            detail=f"{symbol} is not on the mandate include list",
+        )
+
+    # 3. Instrument-type allowance (empty == deny all, fail-closed).
     if intent.instrument_type not in caps.allowed_instruments:
         return _breach(
             broker=broker, remote_tool=remote_tool, intent=intent,
@@ -440,7 +450,7 @@ def check_mandate(
             detail=f"{intent.instrument_type.value} not in allowed_instruments",
         )
 
-    # 3. Asset-class allowance (universe bucket). OPTION has no bucket and is
+    # 4. Asset-class allowance (universe bucket). OPTION has no bucket and is
     #    governed by allowed_instruments alone. An explicit intent.asset_class
     #    (multi-market connectors: US/HK/CN equities) wins over the instrument
     #    default so the gate buckets HK/A-share correctly.
@@ -453,7 +463,7 @@ def check_mandate(
             detail=f"{asset_class.value} not in permitted asset_classes",
         )
 
-    # 4. Single-order notional.
+    # 5. Single-order notional.
     notional = _resolve_order_notional(intent)
     if notional is None:
         return _breach(
