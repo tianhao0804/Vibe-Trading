@@ -224,6 +224,40 @@ def test_include_symbols_allowlist_allows_listed_symbol() -> None:
     assert _check(_intent(symbol="SPCX"), mandate) is None
 
 
+def test_wrapped_robinhood_empty_positions_parse_as_zero_exposure() -> None:
+    mandate = _mandate(
+        account_funding_usd=300.0,
+        max_order_notional_usd=230.0,
+        max_total_exposure_usd=230.0,
+        max_trades_per_day=4,
+    )
+    mandate = Mandate(
+        schema_version=mandate.schema_version,
+        hard_caps=mandate.hard_caps,
+        universe=UniverseConstraint(
+            asset_classes=mandate.universe.asset_classes,
+            min_market_cap_usd=mandate.universe.min_market_cap_usd,
+            min_avg_daily_volume_usd=mandate.universe.min_avg_daily_volume_usd,
+            exclude_symbols=mandate.universe.exclude_symbols,
+            include_symbols=("SPCX",),
+        ),
+        consent=mandate.consent,
+    )
+    positions = {
+        "status": "ok",
+        "structured_content": {
+            "data": {"positions": []},
+            "guide": "Robinhood positions response",
+        },
+    }
+
+    assert _check(
+        _intent(symbol="SPCX", notional_usd=210.45),
+        mandate,
+        positions=positions,
+    ) is None
+
+
 @pytest.mark.parametrize(
     "intent_kwargs, mandate_kwargs, positions, daily_count, expect_limit, expect_kind",
     [

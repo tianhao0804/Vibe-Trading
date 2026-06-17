@@ -277,10 +277,11 @@ def last_price_usd(symbol: str, asset_class: AssetClass) -> float | None:
 def _positions_market_value(positions: object) -> float | None:
     """Sum the USD market value of all open positions, fail-closed.
 
-    Accepts the broker read tool's positions payload in the two shapes the read
-    path may return: a list of position dicts, or a dict envelope with a
-    ``positions`` / ``data`` list. Each position must expose a numeric market
-    value under one of the common keys.
+    Accepts the broker read tool's positions payload in the shapes the read path
+    may return: a list of position dicts, a dict envelope with a ``positions`` /
+    ``data`` list, or the MCP adapter's ``structured_content.data.positions``
+    wrapper. Each position must expose a numeric market value under one of the
+    common keys.
 
     Args:
         positions: Positions payload from the broker's read MCP tool.
@@ -306,12 +307,13 @@ def _coerce_position_rows(positions: object) -> list[dict] | None:
     if isinstance(positions, list):
         rows = positions
     elif isinstance(positions, dict):
-        # TODO(L6): pin the exact Robinhood positions envelope key once the real
-        # read-tool schema is observed (get_positions). Until then accept the
-        # common envelope shapes and fail-closed on anything else.
         rows = positions.get("positions")
         if rows is None:
             rows = positions.get("data")
+        if isinstance(rows, dict):
+            return _coerce_position_rows(rows)
+        if rows is None and isinstance(positions.get("structured_content"), dict):
+            return _coerce_position_rows(positions["structured_content"])
         if rows is None:
             # A bare mapping of symbol -> position dict is also accepted.
             rows = list(positions.values()) if positions else []
