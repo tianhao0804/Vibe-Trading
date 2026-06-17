@@ -1020,7 +1020,7 @@ def _make_jsonable_inner(value: Any, _seen: set[int]) -> Any:
         return [_make_jsonable(item, _seen) for item in value]
     if isinstance(value, dict):
         return {str(key): _make_jsonable(item, _seen) for key, item in value.items()}
-    return value
+    return str(value)
 
 
 def _json_default(value: Any) -> Any:

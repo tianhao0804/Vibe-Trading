@@ -305,6 +305,34 @@ def test_remote_tool_execute_serializes_circular_payload() -> None:
     assert payload["self"] == "[circular]"
 
 
+def test_remote_tool_execute_stringifies_unknown_sdk_objects() -> None:
+    class SdkObject:
+        def __str__(self) -> str:
+            return "SdkObject(order_id='rh_1')"
+
+    class ObjectAdapter:
+        server_name = "demo"
+
+        def call_tool(self, name, arguments, *, local_name=None):
+            return {"status": "ok", "result": SdkObject()}
+
+    tool = MCPRemoteTool(
+        ObjectAdapter(),
+        MCPRemoteToolSpec(
+            server_name="demo",
+            remote_name="place_order",
+            local_name="mcp_demo_place_order",
+            description="Place order",
+            parameters={"type": "object", "additionalProperties": True},
+        ),
+    )
+
+    payload = json.loads(tool.execute(symbol="SPCX"))
+
+    assert payload["status"] == "ok"
+    assert payload["result"] == "SdkObject(order_id='rh_1')"
+
+
 def test_build_mcp_tool_wrappers_disambiguates_colliding_local_names() -> None:
     state = {
         "list_calls": 0,
