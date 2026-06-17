@@ -245,6 +245,7 @@ def test_wrapped_robinhood_empty_positions_parse_as_zero_exposure() -> None:
     )
     positions = {
         "status": "ok",
+        "data": "Root(data=Root(positions=[]))",
         "structured_content": {
             "data": {"positions": []},
             "guide": "Robinhood positions response",

@@ -307,13 +307,18 @@ def _coerce_position_rows(positions: object) -> list[dict] | None:
     if isinstance(positions, list):
         rows = positions
     elif isinstance(positions, dict):
+        structured = positions.get("structured_content")
         rows = positions.get("positions")
         if rows is None:
             rows = positions.get("data")
         if isinstance(rows, dict):
             return _coerce_position_rows(rows)
-        if rows is None and isinstance(positions.get("structured_content"), dict):
-            return _coerce_position_rows(positions["structured_content"])
+        if rows is None and isinstance(structured, dict):
+            return _coerce_position_rows(structured)
+        if rows is not None and not isinstance(rows, list):
+            if isinstance(structured, dict):
+                return _coerce_position_rows(structured)
+            return None
         if rows is None:
             # A bare mapping of symbol -> position dict is also accepted.
             rows = list(positions.values()) if positions else []

@@ -87,6 +87,23 @@ def test_extractor_maps_quantity_and_dollar_amount_alias() -> None:
     assert intent.notional_usd == 600.0
 
 
+def test_extractor_uses_limit_price_as_quantity_notional_floor() -> None:
+    intent = extract_order_intent(
+        "place_equity_order",
+        {
+            "symbol": "SPCX",
+            "side": "buy",
+            "quantity": 1,
+            "type": "limit",
+            "limit_price": 210.45,
+        },
+    )
+
+    assert intent is not None
+    assert intent.quantity == 1.0
+    assert intent.notional_usd == 210.45
+
+
 def test_extractor_ignores_unknown_extra_keys() -> None:
     intent = extract_order_intent(
         "place_equity_order",
@@ -206,6 +223,44 @@ class _NoBrokerQuoteAdapter:
         return {"status": "ok", "order_id": "rh_q", "state": "accepted"}
 
 
+class _WrappedBrokerQuoteAdapter:
+    """Adapter returning the Robinhood MCP structured quote envelope."""
+
+    def __init__(self, *, price: float) -> None:
+        self.server_name = "robinhood"
+        self._price = price
+        self.order_calls: list[dict[str, Any]] = []
+        self.quote_calls = 0
+
+    def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
+        if remote_name in ("get_equity_positions", "get_positions"):
+            return {"positions": [], "status": "ok"}
+        if remote_name in ("get_portfolio", "get_account"):
+            return {"equity": 100000.0, "status": "ok"}
+        if remote_name in ("get_equity_quotes", "get_quotes"):
+            self.quote_calls += 1
+            symbols = arguments.get("symbols") or [arguments.get("symbol")]
+            return {
+                "status": "ok",
+                "data": "Root(data=Root(results=[...]))",
+                "structured_content": {
+                    "data": {
+                        "results": [
+                            {
+                                "quote": {
+                                    "symbol": symbols[0],
+                                    "last_non_reg_trade_price": str(self._price),
+                                    "ask_price": str(self._price + 0.05),
+                                }
+                            }
+                        ]
+                    }
+                },
+            }
+        self.order_calls.append({"remote": remote_name, "arguments": arguments})
+        return {"status": "ok", "order_id": "rh_q", "state": "accepted"}
+
+
 def _guard(adapter):
     return order_guard.LiveOrderGuardTool(adapter, _spec(), broker="robinhood", session_id="s1")
 
@@ -233,6 +288,26 @@ def test_quantity_only_in_mandate_forwards(live_runtime: Path) -> None:
     )
     assert out.get("status") == "ok"
     assert len(adapter.order_calls) == 1
+
+
+def test_quantity_uses_wrapped_robinhood_quote_payload(
+    live_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_mandate(live_runtime, max_order_notional_usd=150.0)
+    monkeypatch.setattr(order_guard, "last_price_usd", lambda sym, ac: 10.0)
+    adapter = _WrappedBrokerQuoteAdapter(price=200.0)
+    guard = _guard(adapter)
+
+    out = json.loads(
+        guard.execute(symbol="AAPL", side="buy", instrument_type="equity", quantity=1.0)
+    )
+
+    assert adapter.quote_calls == 1
+    assert out["status"] == "blocked"
+    assert out["breach"]["limit"] == "max_order_notional_usd"
+    assert out["breach"]["attempted_value"] == 200.0
+    assert adapter.order_calls == []
 
 
 def test_quantity_falls_back_to_data_loader(live_runtime: Path, monkeypatch: pytest.MonkeyPatch) -> None:

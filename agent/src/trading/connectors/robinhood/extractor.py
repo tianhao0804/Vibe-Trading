@@ -8,12 +8,14 @@ notional/quantity to enforce, so it is not an order-intent tool here). The
 legacy ``place_order`` name is still recognized for older tests/configs.
 
 ``place_equity_order`` is sized by ``symbol`` + ``side`` plus exactly one (or,
-defended against, both) of ``dollar_amount`` / ``quantity``. The extractor maps
-these concrete fields and returns ``None`` (→ DENY) on anything missing or
-ambiguous — it never guesses, so the gate defaults to the safe state. Unknown
-extra keys are ignored. When both a notional and a quantity are present the
-extractor surfaces BOTH; the gate reconciles them to the larger enforced
-notional (closing the notional+quantity bypass).
+defended against, both) of ``dollar_amount`` / ``quantity``. For quantity limit
+orders, ``limit_price × quantity`` is surfaced as a notional floor so the gate
+never underestimates maximum spend. The extractor maps these concrete fields
+and returns ``None`` (→ DENY) on anything missing or ambiguous — it never
+guesses, so the gate defaults to the safe state. Unknown extra keys are ignored.
+When both a notional and a quantity are present the extractor surfaces BOTH; the
+gate reconciles them to the larger enforced notional (closing the
+notional+quantity bypass).
 """
 
 from __future__ import annotations
@@ -54,6 +56,9 @@ _NOTIONAL_KEYS = ("notional_usd", "notional", "dollar_amount", "amount")
 
 #: Order-size keys for the share/contract/coin quantity path.
 _QUANTITY_KEYS = ("quantity", "qty", "shares", "units")
+
+#: Limit-price keys whose quantity product is a limit order's maximum notional.
+_LIMIT_PRICE_KEYS = ("limit_price",)
 
 
 def extract_order_intent(remote_name: str, kwargs: dict) -> OrderIntent | None:
@@ -152,6 +157,10 @@ def _extract_size(kwargs: dict) -> tuple[float | None, float | None]:
     """
     notional = _first_positive_float(kwargs, _NOTIONAL_KEYS)
     quantity = _first_positive_float(kwargs, _QUANTITY_KEYS)
+    limit_price = _first_positive_float(kwargs, _LIMIT_PRICE_KEYS)
+    if quantity is not None and limit_price is not None:
+        limit_notional = quantity * limit_price
+        notional = max(notional or 0.0, limit_notional)
     return notional, quantity
 
 

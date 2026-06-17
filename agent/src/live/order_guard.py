@@ -666,13 +666,19 @@ def _parse_quote_price(result: object, symbol: str) -> float | None:
     if direct is not None:
         return direct
 
+    nested_quote = result.get("quote")
+    if isinstance(nested_quote, dict):
+        price = _price_from_quote_dict(nested_quote)
+        if price is not None:
+            return price
+
     keyed = result.get(symbol)
     if isinstance(keyed, dict):
         price = _price_from_quote_dict(keyed)
         if price is not None:
             return price
 
-    for envelope_key in ("data", "result"):
+    for envelope_key in ("structured_content", "data", "result"):
         envelope = result.get(envelope_key)
         if isinstance(envelope, dict):
             price = _parse_quote_price(envelope, symbol)
@@ -688,6 +694,11 @@ def _parse_quote_price(result: object, symbol: str) -> float | None:
             price = _price_from_quote_dict(match)
             if price is not None:
                 return price
+            nested_quote = match.get("quote")
+            if isinstance(nested_quote, dict):
+                price = _price_from_quote_dict(nested_quote)
+                if price is not None:
+                    return price
     return None
 
 
@@ -704,7 +715,10 @@ def _match_quote_row(rows: list, symbol: str) -> dict | None:
 
 def _price_from_quote_dict(quote: dict) -> float | None:
     """Return the first parseable positive price from a quote dict, else None."""
-    for key in ("price", "last_price", "last_trade_price", "last", "mark_price", "close", "ask", "bid"):
+    for key in (
+        "price", "last_price", "last_non_reg_trade_price", "last_trade_price",
+        "last", "mark_price", "ask_price", "ask", "bid_price", "bid", "close",
+    ):
         if key in quote:
             try:
                 value = float(quote[key])
