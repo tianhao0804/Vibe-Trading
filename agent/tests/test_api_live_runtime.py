@@ -14,12 +14,22 @@ All tests run against stubbed runner/liveness state — no real agent or broker.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 import api_server
+from src.live.mandate.model import (
+    MANDATE_SCHEMA_VERSION,
+    AssetClass,
+    ConsentMeta,
+    HardCaps,
+    InstrumentType,
+    Mandate,
+    UniverseConstraint,
+)
 
 
 def _client(tmp_path: Path, monkeypatch) -> TestClient:
@@ -48,6 +58,35 @@ def _valid_mandate_state(broker: str = "robinhood") -> api_server.ActiveMandateS
             max_trades_per_day=5,
             allowed_instruments=["equity"],
             account_funding_usd=5000.0,
+        ),
+    )
+
+
+def _live_mandate(account_ref: str = "RH_AGENTIC_TEST_ACCOUNT") -> Mandate:
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(days=7)
+    return Mandate(
+        schema_version=MANDATE_SCHEMA_VERSION,
+        hard_caps=HardCaps(
+            account_funding_usd=300.0,
+            max_order_notional_usd=50.0,
+            max_total_exposure_usd=150.0,
+            max_leverage=1.0,
+            allowed_instruments=(InstrumentType.EQUITY,),
+            max_trades_per_day=3,
+        ),
+        universe=UniverseConstraint(
+            asset_classes=(AssetClass.US_EQUITY,),
+            min_market_cap_usd=None,
+            min_avg_daily_volume_usd=None,
+            exclude_symbols=(),
+        ),
+        consent=ConsentMeta(
+            created_at=created_at.isoformat(),
+            consent_token_sha256="test-consent",
+            broker="robinhood",
+            account_ref=account_ref,
+            expires_at=expires_at.isoformat(),
         ),
     )
 
@@ -359,6 +398,99 @@ def test_build_live_runner_wires_a_real_runner(tmp_path, monkeypatch) -> None:
     assert runner.runner_id == "robinhood"
 
 
+def test_build_live_runner_reads_robinhood_account_scoped_truth(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path), raising=False)
+    monkeypatch.setattr(api_server, "_runner_factory", None, raising=False)
+    account_ref = "RH_AGENTIC_TEST_ACCOUNT"
+    calls: list[tuple[str, dict]] = []
+
+    class _StubAdapter:
+        def call_tool(self, name, args):
+            calls.append((name, args))
+            if name == "get_portfolio":
+                return {"status": "ok", "cash": 300.0}
+            return {"status": "ok", "result": []}
+
+    class _StubSession:
+        session_id = "live-sess-1"
+
+    class _StubSvc:
+        event_bus = SimpleNamespace(emit=lambda *a, **k: None)
+
+        def create_session(self, title=""):
+            return _StubSession()
+
+        async def send_message(self, sid, content, **kw):
+            return {"message_id": "m1", "attempt_id": "a1"}
+
+    monkeypatch.setattr(api_server, "_live_broker_adapter", lambda broker: _StubAdapter())
+    monkeypatch.setattr(api_server, "_get_session_service", lambda: _StubSvc())
+    monkeypatch.setattr(
+        "src.live.mandate.store.load_mandate",
+        lambda broker: _live_mandate(account_ref),
+    )
+
+    runner = api_server._build_live_runner("robinhood")
+    runner._read_positions()
+    runner._read_balance()
+    runner._read_open_orders()
+
+    assert calls == [
+        ("get_equity_positions", {"account_number": account_ref}),
+        ("get_portfolio", {"account_number": account_ref}),
+        ("get_equity_orders", {"account_number": account_ref}),
+    ]
+
+
+def test_build_live_runner_maps_robinhood_flatten_writes_to_current_schema(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path), raising=False)
+    monkeypatch.setattr(api_server, "_runner_factory", None, raising=False)
+    calls: list[tuple[str, dict]] = []
+
+    class _StubAdapter:
+        def call_tool(self, name, args):
+            calls.append((name, args))
+            return {"status": "ok", "tool": name, "args": args}
+
+    class _StubSession:
+        session_id = "live-sess-1"
+
+    class _StubSvc:
+        event_bus = SimpleNamespace(emit=lambda *a, **k: None)
+
+        def create_session(self, title=""):
+            return _StubSession()
+
+        async def send_message(self, sid, content, **kw):
+            return {"message_id": "m1", "attempt_id": "a1"}
+
+    monkeypatch.setattr(api_server, "_live_broker_adapter", lambda broker: _StubAdapter())
+    monkeypatch.setattr(api_server, "_get_session_service", lambda: _StubSvc())
+
+    runner = api_server._build_live_runner("robinhood")
+    runner._submit_fn({"action": "cancel", "order_id": "ord_1", "symbol": "AAPL"})
+    runner._submit_fn(
+        {"action": "close", "symbol": "AAPL", "side": "sell", "qty": 1.5, "type": "market"}
+    )
+
+    assert calls == [
+        ("cancel_equity_order", {"order_id": "ord_1", "symbol": "AAPL"}),
+        (
+            "place_equity_order",
+            {
+                "symbol": "AAPL",
+                "side": "sell",
+                "type": "market",
+                "time_in_force": "day",
+                "quantity": 1.5,
+            },
+        ),
+    ]
+
+
 def test_runner_start_returns_503_when_broker_unavailable(tmp_path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -424,18 +556,23 @@ def test_live_action_relay_ignores_non_live_results(tmp_path: Path, monkeypatch)
 # --------------------------------------------------------------------------- #
 
 
-def test_fetch_broker_ceilings_derives_from_account(tmp_path, monkeypatch) -> None:
+def test_fetch_broker_ceilings_uses_current_robinhood_portfolio_tool(tmp_path, monkeypatch) -> None:
+    account_ref = "RH_AGENTIC_TEST_ACCOUNT"
+    calls: list[tuple[str, dict]] = []
+
     class _StubAdapter:
         def call_tool(self, name, args):
-            assert name == "get_account"
-            return {"status": "ok", "result": {"buying_power": 4200.0}}
+            calls.append((name, args))
+            return {"status": "ok", "data": {"buying_power": "300.00"}}
 
     monkeypatch.setattr(api_server, "_live_broker_adapter", lambda broker: _StubAdapter())
-    ceilings = api_server._fetch_broker_ceilings("robinhood")
+    ceilings = api_server._fetch_broker_ceilings("robinhood", account_ref=account_ref)
+
+    assert calls == [("get_portfolio", {"account_number": account_ref})]
     assert ceilings == {
-        "account_funding_usd": 4200.0,
-        "max_order_notional_usd": 4200.0,
-        "max_total_exposure_usd": 4200.0,
+        "account_funding_usd": 300.0,
+        "max_order_notional_usd": 300.0,
+        "max_total_exposure_usd": 300.0,
     }
 
 

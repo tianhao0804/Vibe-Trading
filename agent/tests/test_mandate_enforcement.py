@@ -61,9 +61,9 @@ class _MockAdapter:
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
         self.call_records.append({"remote": remote_name, "arguments": arguments})
-        if remote_name in ("get_positions", "list_positions"):
+        if remote_name in ("get_equity_positions", "get_positions", "list_positions"):
             return {"positions": self._positions, "status": "ok"}
-        if remote_name in ("get_account", "get_balance", "get_buying_power"):
+        if remote_name in ("get_portfolio", "get_account", "get_balance", "get_buying_power"):
             return {"equity": self._balance, "status": "ok"}
         # The order placement itself (super().execute forwards here).
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
@@ -357,9 +357,9 @@ class _FailingForwardAdapter:
         self.order_calls: list[dict[str, Any]] = []
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
-        if remote_name == "get_positions":
+        if remote_name in ("get_equity_positions", "get_positions"):
             return {"positions": [], "status": "ok"}
-        if remote_name == "get_account":
+        if remote_name in ("get_portfolio", "get_account"):
             return {"equity": 5000.0, "status": "ok"}
         # The order placement fails at the broker.
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
@@ -438,13 +438,14 @@ class _QuoteAdapter:
         self.quote_calls: list[dict[str, Any]] = []
 
     def call_tool(self, remote_name: str, arguments: dict, *, local_name: str | None = None) -> dict:
-        if remote_name == "get_positions":
+        if remote_name in ("get_equity_positions", "get_positions"):
             return {"positions": self._positions, "status": "ok"}
-        if remote_name == "get_account":
+        if remote_name in ("get_portfolio", "get_account"):
             return {"equity": self._balance, "status": "ok"}
-        if remote_name == "get_quotes":
+        if remote_name in ("get_equity_quotes", "get_quotes"):
             self.quote_calls.append({"arguments": arguments})
-            return {"status": "ok", "symbol": arguments.get("symbol"), "price": self._price}
+            symbol = (arguments.get("symbols") or [arguments.get("symbol")])[0]
+            return {"status": "ok", "symbol": symbol, "price": self._price}
         self.order_calls.append({"remote": remote_name, "arguments": arguments})
         return {"status": "ok", "order_id": "rh_test_1", "state": "accepted"}
 

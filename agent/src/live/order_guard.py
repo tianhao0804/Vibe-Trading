@@ -162,8 +162,15 @@ class LiveOrderGuardTool(MCPRemoteTool):
                 mandate=mandate,
             )
 
-        positions = self._read_first(self._read_tools("positions", _POSITIONS_TOOLS))
-        balance = self._read_first(self._read_tools("account", _BALANCE_TOOLS))
+        account_read_args = self._account_read_args(mandate)
+        positions = self._read_first(
+            self._read_tools("positions", _POSITIONS_TOOLS),
+            arguments=account_read_args,
+        )
+        balance = self._read_first(
+            self._read_tools("account", _BALANCE_TOOLS),
+            arguments=account_read_args,
+        )
         daily_count = self._read_daily_count()
 
         breach = check_mandate(
@@ -272,9 +279,10 @@ class LiveOrderGuardTool(MCPRemoteTool):
             A positive USD price, or ``None``.
         """
         for remote in self._read_tools("quote", _QUOTE_TOOLS):
+            quote_args = {"symbols": [symbol]} if remote == "get_equity_quotes" else {"symbol": symbol}
             try:
                 result = self._adapter.call_tool(
-                    remote, {"symbol": symbol}, local_name=remote
+                    remote, quote_args, local_name=remote
                 )
             except Exception as exc:
                 logger.warning("broker quote tool %s failed: %s", remote, exc)
@@ -447,7 +455,14 @@ class LiveOrderGuardTool(MCPRemoteTool):
 
     # -- read snapshot ------------------------------------------------------
 
-    def _read_first(self, candidates: tuple[str, ...]) -> object:
+    def _account_read_args(self, mandate: Mandate) -> dict[str, str]:
+        """Return broker read arguments derived from the committed mandate."""
+        account_ref = (mandate.consent.account_ref or "").strip()
+        if self.broker == "robinhood" and account_ref:
+            return {"account_number": account_ref}
+        return {}
+
+    def _read_first(self, candidates: tuple[str, ...], *, arguments: dict | None = None) -> object:
         """Read the first responsive broker read tool, fail-closed.
 
         Routes through the plain ``MCPServerAdapter.call_tool`` path (NOT the
@@ -456,13 +471,15 @@ class LiveOrderGuardTool(MCPRemoteTool):
 
         Args:
             candidates: Ordered remote read-tool names to try.
+            arguments: Optional broker-specific read arguments.
 
         Returns:
             The first successful tool result payload, or ``None``.
         """
+        read_args = arguments or {}
         for remote in candidates:
             try:
-                result = self._adapter.call_tool(remote, {}, local_name=remote)
+                result = self._adapter.call_tool(remote, read_args, local_name=remote)
             except Exception as exc:
                 logger.warning("live read tool %s failed: %s", remote, exc)
                 continue
@@ -479,7 +496,9 @@ class LiveOrderGuardTool(MCPRemoteTool):
             remote = runner_tool_name(self.broker, operation)
         except Exception:  # pragma: no cover - guard must fail closed later
             remote = None
-        return (remote,) if remote else fallback
+        if remote:
+            return tuple(dict.fromkeys((remote, *fallback)))
+        return fallback
 
     # -- daily counter ------------------------------------------------------
 
@@ -653,6 +672,13 @@ def _parse_quote_price(result: object, symbol: str) -> float | None:
         if price is not None:
             return price
 
+    for envelope_key in ("data", "result"):
+        envelope = result.get(envelope_key)
+        if isinstance(envelope, dict):
+            price = _parse_quote_price(envelope, symbol)
+            if price is not None:
+                return price
+
     for container_key in ("quotes", "data", "results"):
         rows = result.get(container_key)
         if not isinstance(rows, list):
@@ -678,7 +704,7 @@ def _match_quote_row(rows: list, symbol: str) -> dict | None:
 
 def _price_from_quote_dict(quote: dict) -> float | None:
     """Return the first parseable positive price from a quote dict, else None."""
-    for key in ("price", "last_price", "last", "mark_price", "close", "ask", "bid"):
+    for key in ("price", "last_price", "last_trade_price", "last", "mark_price", "close", "ask", "bid"):
         if key in quote:
             try:
                 value = float(quote[key])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from src.trading.profiles import list_profiles, profile_by_id
@@ -71,7 +72,7 @@ def get_account(profile_id: str | None = None, **overrides: Any) -> dict[str, An
     if profile.transport == "broker_sdk":
         module = _sdk_module(profile.connector)
         return _with_profile(profile, module.get_account_snapshot(module.build_config(profile.config, overrides)))
-    return _call_remote(profile, "account", {})
+    return _call_remote(profile, "account", overrides)
 
 
 def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, Any]:
@@ -84,7 +85,7 @@ def get_positions(profile_id: str | None = None, **overrides: Any) -> dict[str, 
     if profile.transport == "broker_sdk":
         module = _sdk_module(profile.connector)
         return _with_profile(profile, module.get_positions(module.build_config(profile.config, overrides)))
-    return _call_remote(profile, "positions", {})
+    return _call_remote(profile, "positions", overrides)
 
 
 def get_open_orders(
@@ -108,7 +109,8 @@ def get_open_orders(
             profile,
             module.get_open_orders(module.build_config(profile.config, overrides), include_executions=include_executions),
         )
-    return _call_remote(profile, "orders", {})
+    remote_args = {"include_executions": include_executions, **overrides}
+    return _call_remote(profile, "orders", remote_args)
 
 
 def get_quote(
@@ -250,12 +252,24 @@ def place_order(
     """Place an order via a connector profile.
 
     Paper profiles place directly against the broker's sandbox account. Live
-    profiles route through the direct-SDK mandate gate (mandate + kill switch +
+    profiles route through the mandate gate (mandate + kill switch +
     fail-closed pre-trade checks + audit) before any order reaches the broker.
-    Only ``broker_sdk`` connectors are supported here; Robinhood keeps its MCP
-    gate and IBKR stays read-only.
+    Direct SDK profiles use ``execute_live_order``; live remote-MCP profiles
+    use the same ``LiveOrderGuardTool`` wrapper as raw MCP registration.
     """
     profile = profile_by_id(profile_id)
+    if profile.transport == "remote_mcp" and profile.environment == "live":
+        return _place_remote_live_order(
+            profile,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            notional=notional,
+            order_type=order_type,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+            session_id=session_id,
+        )
     if profile.transport != "broker_sdk":
         return _unsupported(profile, "orders.place")
 
@@ -314,6 +328,13 @@ def cancel_order(
     action must be logged (Red Lines).
     """
     profile = profile_by_id(profile_id)
+    if profile.transport == "remote_mcp" and profile.environment == "live":
+        return _cancel_remote_live_order(
+            profile,
+            order_id=order_id,
+            symbol=symbol,
+            session_id=session_id,
+        )
     if profile.transport != "broker_sdk":
         return _unsupported(profile, "orders.cancel")
     module = _sdk_module(profile.connector)
@@ -324,7 +345,208 @@ def cancel_order(
     return _with_profile(profile, result)
 
 
-def _audit_live_cancel(profile, order_id, symbol, result, session_id) -> None:
+def _place_remote_live_order(
+    profile: TradingProfile,
+    *,
+    symbol: str,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+    order_type: str,
+    limit_price: float | None,
+    time_in_force: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Place a live remote-MCP order through the mandate guard."""
+    from src.live.order_guard import LiveOrderGuardTool
+    from src.tools.mcp import MCPRemoteToolSpec, MCPServerAdapter
+
+    remote_name = runner_tool_name(profile.connector, "submit_order")
+    if remote_name is None:
+        return _unsupported(profile, "orders.place")
+
+    context = _remote_write_context(profile, remote_name)
+    if "error" in context:
+        return context["error"]
+
+    broker_request = _remote_order_arguments(
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        notional=notional,
+        order_type=order_type,
+        limit_price=limit_price,
+        time_in_force=time_in_force,
+    )
+    adapter = MCPServerAdapter(context["server_name"], context["server"])
+    spec = MCPRemoteToolSpec(
+        server_name=context["server_name"],
+        remote_name=remote_name,
+        local_name=f"mcp_{context['server_name']}_{remote_name}",
+        description=f"Live {profile.connector} order placement via remote MCP.",
+        parameters={"type": "object", "additionalProperties": True},
+    )
+    raw = LiveOrderGuardTool(
+        adapter,
+        spec,
+        broker=profile.connector,
+        session_id=session_id,
+    ).execute(**broker_request)
+    return _with_profile(profile, _json_object_payload(raw))
+
+
+def _cancel_remote_live_order(
+    profile: TradingProfile,
+    *,
+    order_id: str,
+    symbol: str | None,
+    session_id: str,
+) -> dict[str, Any]:
+    """Cancel a live remote-MCP order and audit the risk-reducing write."""
+    from src.tools.mcp import MCPServerAdapter
+
+    remote_name = runner_tool_name(profile.connector, "cancel_order")
+    if remote_name is None:
+        return _unsupported(profile, "orders.cancel")
+
+    context = _remote_write_context(profile, remote_name)
+    if "error" in context:
+        return context["error"]
+
+    broker_request: dict[str, Any] = {"order_id": order_id}
+    if symbol:
+        broker_request["symbol"] = symbol
+
+    adapter = MCPServerAdapter(context["server_name"], context["server"])
+    try:
+        result = adapter.call_tool(remote_name, broker_request)
+    except Exception as exc:  # noqa: BLE001 - cancel audit should capture failures
+        result = {"status": "error", "error": str(exc)}
+    _audit_live_cancel(
+        profile,
+        order_id,
+        symbol,
+        result,
+        session_id,
+        remote_tool=remote_name,
+        broker_request=broker_request,
+    )
+    return _with_profile(profile, result)
+
+
+def _remote_order_arguments(
+    *,
+    symbol: str,
+    side: str,
+    quantity: float | None,
+    notional: float | None,
+    order_type: str,
+    limit_price: float | None,
+    time_in_force: str,
+) -> dict[str, Any]:
+    """Map generic trading tool order fields to Robinhood's current MCP schema."""
+    args: dict[str, Any] = {
+        "symbol": str(symbol or "").strip().upper(),
+        "side": str(side or "").strip().lower(),
+        "type": str(order_type or "market").strip().lower(),
+        "time_in_force": str(time_in_force or "day").strip().lower(),
+    }
+    if notional is not None:
+        args["dollar_amount"] = float(notional)
+    if quantity is not None:
+        args["quantity"] = float(quantity)
+    if limit_price is not None:
+        args["limit_price"] = float(limit_price)
+    return args
+
+
+def _remote_write_context(profile: TradingProfile, remote_name: str) -> dict[str, Any]:
+    """Resolve a live remote-MCP write channel, enforcing config + OAuth gates."""
+    from src.config.loader import load_agent_config
+    from src.live.registry import has_cached_oauth_token
+
+    server_name = str(profile.config.get("server") or profile.connector)
+    server = (load_agent_config().mcp_servers or {}).get(server_name)
+    if server is None:
+        return {
+            "error": {
+                "status": "error",
+                "profile_id": profile.id,
+                "connector": profile.connector,
+                "environment": profile.environment,
+                "transport": profile.transport,
+                "error": f"remote MCP server '{server_name}' is not configured",
+            }
+        }
+
+    enabled_tools = list(getattr(server, "enabled_tools", None) or [])
+    if "*" not in enabled_tools and remote_name not in enabled_tools:
+        return {
+            "error": {
+                "status": "error",
+                "profile_id": profile.id,
+                "connector": profile.connector,
+                "environment": profile.environment,
+                "transport": profile.transport,
+                "error": f"remote tool '{remote_name}' is not enabled for connector profile '{profile.id}'",
+                "enabled_tools": enabled_tools,
+            }
+        }
+
+    auth = getattr(server, "auth", None)
+    if auth is None:
+        return {
+            "error": {
+                "status": "error",
+                "profile_id": profile.id,
+                "connector": profile.connector,
+                "environment": profile.environment,
+                "transport": profile.transport,
+                "error": f"connector profile '{profile.id}' has no OAuth auth configured",
+            }
+        }
+    if not has_cached_oauth_token(server.url, auth.cache_dir):
+        return {
+            "error": {
+                "status": "not_authorized",
+                "profile_id": profile.id,
+                "connector": profile.connector,
+                "environment": profile.environment,
+                "transport": profile.transport,
+                "error": (
+                    f"connector profile '{profile.id}' is not authorized. "
+                    f"Run `vibe-trading connector authorize {profile.id}` from a desktop session."
+                ),
+            }
+        }
+    return {"server_name": server_name, "server": server}
+
+
+def _json_object_payload(raw: Any) -> dict[str, Any]:
+    """Return a dict payload from a JSON string or arbitrary object."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"status": "error", "error": "remote live order returned invalid JSON"}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"status": "ok", "result": parsed}
+    return {"status": "ok", "result": raw}
+
+
+def _audit_live_cancel(
+    profile,
+    order_id,
+    symbol,
+    result,
+    session_id,
+    *,
+    remote_tool: str = "cancel_order",
+    broker_request: dict[str, Any] | None = None,
+) -> None:
     """Write a live-action audit record for a live order cancellation (best-effort)."""
     try:
         from src.live.audit import LiveActionEvent, write_live_action
@@ -335,11 +557,11 @@ def _audit_live_cancel(profile, order_id, symbol, result, session_id) -> None:
             session_id=session_id,
             outcome="accepted" if ok else "error",
             server=profile.connector,
-            remote_tool="cancel_order",
+            remote_tool=remote_tool,
             intent_normalized=f"cancel {order_id} {symbol or ''}".strip(),
             mandate_snapshot_ref=None,
             consent_record_ref=None,
-            broker_request={"order_id": order_id, "symbol": symbol},
+            broker_request=broker_request or {"order_id": order_id, "symbol": symbol},
             broker_response=result if isinstance(result, dict) else {"raw": result},
             gate_decision={"allowed": True, "decision": "cancel"},
             error=None if ok else (result.get("error") if isinstance(result, dict) else "cancel failed"),
@@ -511,10 +733,22 @@ def _call_remote(profile: TradingProfile, operation: str, arguments: dict[str, A
             ),
         }
 
+    try:
+        remote_arguments = _remote_arguments(profile.connector, operation, arguments)
+    except ValueError as exc:
+        return {
+            "status": "error",
+            "profile_id": profile.id,
+            "connector": profile.connector,
+            "environment": profile.environment,
+            "transport": profile.transport,
+            "error": str(exc),
+        }
+
     adapter = MCPServerAdapter(server_name, server)
     return _with_profile(
         profile,
-        adapter.call_tool(remote_name, _remote_arguments(profile.connector, operation, arguments)),
+        adapter.call_tool(remote_name, remote_arguments),
     )
 
 

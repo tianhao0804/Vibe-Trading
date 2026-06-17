@@ -1,18 +1,19 @@
 """Robinhood order-intent extractor (SPEC.md Mandate Enforcement §4).
 
-Maps Robinhood's ``place_order`` tool kwargs to the normalized
+Maps Robinhood's current ``place_equity_order`` tool kwargs to the normalized
 :class:`~src.live.enforcement.OrderIntent`. Pinned against the frozen Robinhood
-catalog: the only order-placing WRITE tool is ``place_order`` (``cancel_order``
-is a WRITE but not an *order placement* — it carries no notional/quantity to
-enforce, so it is not an order-intent tool here).
+catalog: the order-placing equity WRITE tool is ``place_equity_order``
+(``cancel_equity_order`` is a WRITE but not an *order placement* — it carries no
+notional/quantity to enforce, so it is not an order-intent tool here). The
+legacy ``place_order`` name is still recognized for older tests/configs.
 
-``place_order`` is sized by ``symbol`` + ``side`` plus exactly one (or, defended
-against, both) of ``notional_usd`` / ``quantity`` (``dollar_amount`` accepted as
-a notional alias). The extractor maps these concrete fields and returns ``None``
-(→ DENY) on anything missing or ambiguous — it never guesses, so the gate
-defaults to the safe state. Unknown extra keys are ignored. When both a notional
-and a quantity are present the extractor surfaces BOTH; the gate reconciles them
-to the larger enforced notional (closing the notional+quantity bypass).
+``place_equity_order`` is sized by ``symbol`` + ``side`` plus exactly one (or,
+defended against, both) of ``dollar_amount`` / ``quantity``. The extractor maps
+these concrete fields and returns ``None`` (→ DENY) on anything missing or
+ambiguous — it never guesses, so the gate defaults to the safe state. Unknown
+extra keys are ignored. When both a notional and a quantity are present the
+extractor surfaces BOTH; the gate reconciles them to the larger enforced
+notional (closing the notional+quantity bypass).
 """
 
 from __future__ import annotations
@@ -21,9 +22,9 @@ from src.live.enforcement import OrderIntent
 from src.live.mandate.model import InstrumentType
 
 #: Remote tool names this extractor recognizes as order placements. Frozen to
-#: the canonical catalog: ``place_order`` is the sole order-placing WRITE tool
-#: (``cancel_order`` carries no order intent to size).
-_ORDER_TOOLS = frozenset({"place_order"})
+#: the current catalog uses ``place_equity_order``. ``place_order`` is kept as a
+#: backward-compatible alias for older fixtures.
+_ORDER_TOOLS = frozenset({"place_equity_order", "place_order"})
 
 #: Accepted side spellings → normalized ``"buy"`` / ``"sell"``.
 _SIDE_ALIASES = {
@@ -84,7 +85,7 @@ def extract_order_intent(remote_name: str, kwargs: dict) -> OrderIntent | None:
     if side is None:
         return None
 
-    instrument = _extract_instrument(kwargs)
+    instrument = _extract_instrument(remote_name, kwargs)
     if instrument is None:
         return None
 
@@ -123,11 +124,13 @@ def _extract_side(kwargs: dict) -> str | None:
     return None
 
 
-def _extract_instrument(kwargs: dict) -> InstrumentType | None:
+def _extract_instrument(remote_name: str, kwargs: dict) -> InstrumentType | None:
     """Return the mapped :class:`InstrumentType`, or ``None`` if absent/unknown.
 
-    An absent/unknown instrument is ambiguous → DENY (fail-closed), never a
-    silent default.
+    The current Robinhood write tool is specifically equity-scoped, so an
+    omitted instrument on ``place_equity_order`` maps to EQUITY. The legacy
+    ``place_order`` path still requires an explicit instrument to avoid widening
+    old generic broker calls.
     """
     for key in ("instrument_type", "asset_class", "type", "instrument_class"):
         value = kwargs.get(key)
@@ -135,6 +138,8 @@ def _extract_instrument(kwargs: dict) -> InstrumentType | None:
             mapped = _INSTRUMENT_ALIASES.get(value.strip().lower())
             if mapped is not None:
                 return mapped
+    if remote_name == "place_equity_order":
+        return InstrumentType.EQUITY
     return None
 
 

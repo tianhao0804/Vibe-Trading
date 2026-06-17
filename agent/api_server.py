@@ -2671,37 +2671,53 @@ def _live_action_frame_from_tool_result(event: Any) -> Optional[str]:
     return frame.to_sse()
 
 
-def _fetch_broker_ceilings(broker: str) -> Optional[Dict[str, Any]]:
+def _fetch_broker_ceilings(broker: str, *, account_ref: str = "") -> Optional[Dict[str, Any]]:
     """Best-effort fetch of broker-side account ceilings for the commit re-check.
 
-    Reads the broker's ``get_account`` tool and derives an authoritative ceiling
+    Reads the broker's account tool and derives an authoritative ceiling
     snapshot (buying power / funding) so the commit-time fit check binds to the
     venue's real limits rather than an agent-proposed number. Returns ``None`` on
     any failure (channel not configured, tool error, fields not recognized) so
     the caller falls back to the proposal's own snapshot — a commit is never
-    blocked on a broker read. The exact Robinhood field names are finalized
-    post-access (L6); we probe the common ones.
+    blocked on a broker read. Robinhood's current catalog exposes this as
+    ``get_portfolio`` and requires the selected account number.
 
     Args:
         broker: The live-broker key.
+        account_ref: Opaque broker account identifier committed by the user.
 
     Returns:
         A ceilings dict (canonical keys) or ``None`` to fall back.
     """
+    broker_key = str(broker or "").strip().lower()
+    read_args: Dict[str, Any] = {}
+    if broker_key == "robinhood":
+        account_number = str(account_ref or "").strip()
+        if not account_number:
+            return None
+        read_args = {"account_number": account_number}
     try:
         adapter = _live_broker_adapter(broker)
     except LiveRunnerUnavailable:
         return None
     try:
-        result = adapter.call_tool("get_account", {})
+        from src.trading.service import runner_tool_name
+
+        account_tool = runner_tool_name(broker_key, "account") or "get_account"
+        result = adapter.call_tool(account_tool, read_args)
     except Exception:  # pragma: no cover - status/commit must never raise here
         logger.debug("broker ceiling fetch failed for %s", broker, exc_info=True)
         return None
     if not isinstance(result, dict) or result.get("status") == "error":
         return None
-    payload = result.get("result") if isinstance(result.get("result"), dict) else result
+    if isinstance(result.get("result"), dict):
+        payload = result["result"]
+    elif isinstance(result.get("data"), dict):
+        payload = result["data"]
+    else:
+        payload = result
     funding: Optional[float] = None
-    for key in ("account_funding_usd", "buying_power", "cash", "portfolio_value", "equity"):
+    for key in ("account_funding_usd", "buying_power", "cash", "portfolio_value", "equity", "total"):
         raw = payload.get(key) if isinstance(payload, dict) else None
         try:
             if raw is not None:
@@ -2741,7 +2757,10 @@ async def commit_mandate_endpoint(payload: CommitMandateRequest):
     # number the model proposed. Best-effort — falls back to the proposal's own
     # ceilings (commit_mandate handles ceilings_ref=None) when the broker channel
     # is unavailable or the read fails (we never block a commit on a broker read).
-    broker_ceilings = _fetch_broker_ceilings(payload.broker)
+    broker_ceilings = _fetch_broker_ceilings(
+        payload.broker,
+        account_ref=payload.account_ref,
+    )
 
     try:
         result = commit_mandate(
@@ -3101,17 +3120,62 @@ def _build_live_runner(broker: str) -> Any:
     cancel_order_tool = _tool("cancel_order")
     adapter = _live_broker_adapter(broker)  # raises LiveRunnerUnavailable if absent
 
-    def _read(remote_tool: str):
+    def _account_read_args() -> Dict[str, Any]:
+        if broker != "robinhood":
+            return {}
+        try:
+            from src.live.mandate.store import load_mandate
+
+            mandate = load_mandate(broker)
+        except Exception:  # pragma: no cover - runner read fails closed downstream
+            logger.debug("failed to load mandate for %s account-scoped read", broker, exc_info=True)
+            return {}
+        account_number = ""
+        if mandate is not None:
+            account_number = str(getattr(mandate.consent, "account_ref", "") or "").strip()
+        if not account_number:
+            return {}
+        return {"account_number": account_number}
+
+    def _read(remote_tool: str, *, account_scoped: bool = False):
         """A zero-arg broker READ callable bound to one remote tool."""
-        return lambda: adapter.call_tool(remote_tool, {})
+        return lambda: adapter.call_tool(
+            remote_tool,
+            _account_read_args() if account_scoped else {},
+        )
+
+    def _submit_args(order: Dict[str, Any]) -> Dict[str, Any]:
+        if broker != "robinhood":
+            return order
+        if order.get("action") == "cancel":
+            args = {"order_id": order.get("order_id")}
+            if order.get("symbol"):
+                args["symbol"] = order.get("symbol")
+            return {key: value for key, value in args.items() if value is not None}
+        args: Dict[str, Any] = {
+            "symbol": order.get("symbol"),
+            "side": order.get("side"),
+            "type": order.get("type") or order.get("order_type") or "market",
+            "time_in_force": order.get("time_in_force") or "day",
+        }
+        quantity = order.get("quantity", order.get("qty"))
+        notional = order.get("dollar_amount", order.get("notional_usd", order.get("notional")))
+        if quantity is not None:
+            args["quantity"] = quantity
+        if notional is not None:
+            args["dollar_amount"] = notional
+        if order.get("limit_price") is not None:
+            args["limit_price"] = order.get("limit_price")
+        return {key: value for key, value in args.items() if value is not None}
 
     def _submit(order: Dict[str, Any]) -> Dict[str, Any]:
         # Route the flatten sweep's normalized order to the broker's write tools.
-        # Field mapping against the real Robinhood schema is finalized post-access
-        # (L6); the action discriminator is broker-agnostic.
+        # The action discriminator is broker-agnostic; Robinhood's current MCP
+        # write schema is normalized here before the remote call.
+        request = _submit_args(order)
         if order.get("action") == "cancel":
-            return adapter.call_tool(cancel_order_tool, order)
-        return adapter.call_tool(submit_order_tool, order)
+            return adapter.call_tool(cancel_order_tool, request)
+        return adapter.call_tool(submit_order_tool, request)
 
     svc = _get_session_service()
     session = svc.create_session(title=f"live-runner:{broker}")
@@ -3146,9 +3210,9 @@ def _build_live_runner(broker: str) -> Any:
         broker,
         agent_caller=_agent_caller,
         reconcile_fn=reconcile,
-        read_positions=_read(positions_tool),
-        read_balance=_read(balance_tool),
-        read_open_orders=_read(open_orders_tool),
+        read_positions=_read(positions_tool, account_scoped=True),
+        read_balance=_read(balance_tool, account_scoped=True),
+        read_open_orders=_read(open_orders_tool, account_scoped=True),
         submit_fn=_submit,
         write_audit_fn=_audit_with_bus,
         scheduler=scheduler,
